@@ -24,6 +24,8 @@ func TestHostDeviceNames(t *testing.T) {
 		{"Reconcile", testHostDeviceNamesReconcile},
 		{"HostDeletionCleanup", testHostDeviceNamesHostDeletionCleanup},
 		{"FullLifecycle", testHostDeviceNamesFullLifecycle},
+		{"ResolveResult", testHostDeviceNamesResolveResult},
+		{"VerifyGracePeriod", testHostDeviceNamesVerifyGracePeriod},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -152,25 +154,25 @@ func testHostDeviceNamesCommandLifecycle(t *testing.T, ds *Datastore) {
 	require.NoError(t, err)
 	require.Empty(t, pending)
 
-	// An acknowledgment updates the row by command UUID and returns the host and
-	// expected name so the caller can rename the host in Fleet.
-	gotUUID, gotName, err := ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-cmd-1", fleet.MDMDeliveryVerifying, "")
-	require.NoError(t, err)
-	require.Equal(t, host.UUID, gotUUID)
-	require.Equal(t, "WS-SERIAL123", gotName)
+	// An acknowledgment moves the row to verifying and renames the host in Fleet
+	// (computer_name, hostname, display name) to the expected name, atomically.
+	require.NoError(t, ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-cmd-1", fleet.MDMDeliveryVerifying, ""))
 	require.Equal(t, fleet.MDMDeliveryVerifying, *getDeviceNameRow(t, ds, host.UUID).Status)
-
-	// An error result records the Apple detail.
-	require.NoError(t, ds.SetHostDeviceNameCommandSent(ctx, host.UUID, "DEVNAME-cmd-2", "WS-SERIAL123"))
-	gotUUID, _, err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-cmd-2", fleet.MDMDeliveryFailed, "Apple error chain")
+	renamed, err := ds.Host(ctx, host.ID)
 	require.NoError(t, err)
-	require.Equal(t, host.UUID, gotUUID)
+	require.Equal(t, "WS-SERIAL123", renamed.ComputerName)
+	require.Equal(t, "WS-SERIAL123", renamed.Hostname)
+	require.Equal(t, "WS-SERIAL123", renamed.DisplayName())
+
+	// An error result records the Apple detail and does not rename the host.
+	require.NoError(t, ds.SetHostDeviceNameCommandSent(ctx, host.UUID, "DEVNAME-cmd-2", "WS-SERIAL123"))
+	require.NoError(t, ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-cmd-2", fleet.MDMDeliveryFailed, "Apple error chain"))
 	row = getDeviceNameRow(t, ds, host.UUID)
 	require.Equal(t, fleet.MDMDeliveryFailed, *row.Status)
 	require.Equal(t, "Apple error chain", row.Detail)
 
 	// An unknown command UUID is a not-found error.
-	_, _, err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-nope", fleet.MDMDeliveryVerifying, "")
+	err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-nope", fleet.MDMDeliveryVerifying, "")
 	require.True(t, fleet.IsNotFound(err))
 
 	// Getting an enforcement row for a host with none is a not-found error.
@@ -193,7 +195,7 @@ func testHostDeviceNamesVerify(t *testing.T, ds *Datastore) {
 	require.Equal(t, fleet.MDMDeliveryPending, *getDeviceNameRow(t, ds, host.UUID).Status)
 
 	// Move to verifying, then a matching report verifies it.
-	_, _, err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-cmd", fleet.MDMDeliveryVerifying, "")
+	err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-cmd", fleet.MDMDeliveryVerifying, "")
 	require.NoError(t, err)
 	require.NoError(t, ds.VerifyHostDeviceName(ctx, host.UUID, "WS-1"))
 	require.Equal(t, fleet.MDMDeliveryVerified, *getDeviceNameRow(t, ds, host.UUID).Status)
@@ -231,7 +233,7 @@ func testHostDeviceNamesResend(t *testing.T, ds *Datastore) {
 
 	require.NoError(t, ds.BulkUpsertHostDeviceNameEnforcement(ctx, team.ID))
 	require.NoError(t, ds.SetHostDeviceNameCommandSent(ctx, host.UUID, "DEVNAME-cmd", "WS-1"))
-	_, _, err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-cmd", fleet.MDMDeliveryFailed, "boom")
+	err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-cmd", fleet.MDMDeliveryFailed, "boom")
 	require.NoError(t, err)
 	require.Equal(t, fleet.MDMDeliveryFailed, *getDeviceNameRow(t, ds, host.UUID).Status)
 
@@ -243,7 +245,7 @@ func testHostDeviceNamesResend(t *testing.T, ds *Datastore) {
 	require.Nil(t, row.CommandUUID)
 
 	// The previous command's late acknowledgment no longer matches any row.
-	_, _, err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-cmd", fleet.MDMDeliveryVerifying, "")
+	err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-cmd", fleet.MDMDeliveryVerifying, "")
 	require.True(t, fleet.IsNotFound(err))
 	require.Nil(t, getDeviceNameRow(t, ds, host.UUID).Status, "late ack must not resurrect the row")
 
@@ -318,6 +320,94 @@ func testHostDeviceNamesHostDeletionCleanup(t *testing.T, ds *Datastore) {
 	require.True(t, fleet.IsNotFound(err), "enforcement row must be deleted with the host")
 }
 
+func testHostDeviceNamesResolveResult(t *testing.T, ds *Datastore) {
+	ctx := t.Context()
+
+	team, err := ds.NewTeam(ctx, &fleet.Team{Name: "resolve-team"})
+	require.NoError(t, err)
+	host := enrollAppleHostForDeviceName(t, ds, "mac", "darwin", team.ID, false)
+
+	require.NoError(t, ds.BulkUpsertHostDeviceNameEnforcement(ctx, team.ID))
+
+	// A too-long resolution fails the row without sending a command; the row
+	// leaves the pending list so the cron does not retry it.
+	require.NoError(t, ds.SetHostDeviceNameResolveResult(ctx, host.UUID, fleet.MDMDeliveryFailed, "", "Resolved name exceeds 63 bytes."))
+	row := getDeviceNameRow(t, ds, host.UUID)
+	require.NotNil(t, row.Status)
+	require.Equal(t, fleet.MDMDeliveryFailed, *row.Status)
+	require.Equal(t, "Resolved name exceeds 63 bytes.", row.Detail)
+	require.Nil(t, row.CommandUUID)
+	pending, err := ds.ListHostsPendingDeviceNameCommand(ctx, 10)
+	require.NoError(t, err)
+	require.Empty(t, pending)
+
+	// An already-matching host goes straight to verified with the resolved name
+	// recorded, so later reports can still detect drift from that name.
+	require.NoError(t, ds.ResendHostDeviceName(ctx, host.UUID))
+	require.NoError(t, ds.SetHostDeviceNameResolveResult(ctx, host.UUID, fleet.MDMDeliveryVerified, "WS-1", ""))
+	row = getDeviceNameRow(t, ds, host.UUID)
+	require.Equal(t, fleet.MDMDeliveryVerified, *row.Status)
+	require.NotNil(t, row.ExpectedDeviceName)
+	require.Equal(t, "WS-1", *row.ExpectedDeviceName)
+	require.NoError(t, ds.VerifyHostDeviceName(ctx, host.UUID, "renamed-on-device"))
+	require.Equal(t, fleet.MDMDeliveryFailed, *getDeviceNameRow(t, ds, host.UUID).Status)
+
+	// Recording a resolve result clears any previously sent command UUID, so a
+	// stale result for that command can't overwrite the outcome.
+	require.NoError(t, ds.ResendHostDeviceName(ctx, host.UUID))
+	require.NoError(t, ds.SetHostDeviceNameCommandSent(ctx, host.UUID, "DEVNAME-stale", "WS-1"))
+	require.NoError(t, ds.SetHostDeviceNameResolveResult(ctx, host.UUID, fleet.MDMDeliveryVerified, "WS-1", ""))
+	err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-stale", fleet.MDMDeliveryFailed, "boom")
+	require.True(t, fleet.IsNotFound(err))
+	require.Equal(t, fleet.MDMDeliveryVerified, *getDeviceNameRow(t, ds, host.UUID).Status)
+
+	// A host with no row is a no-op (no error).
+	require.NoError(t, ds.SetHostDeviceNameResolveResult(ctx, "missing-uuid", fleet.MDMDeliveryVerified, "WS-1", ""))
+}
+
+func testHostDeviceNamesVerifyGracePeriod(t *testing.T, ds *Datastore) {
+	ctx := t.Context()
+
+	team, err := ds.NewTeam(ctx, &fleet.Team{Name: "grace-team"})
+	require.NoError(t, err)
+	host := enrollAppleHostForDeviceName(t, ds, "mac", "darwin", team.ID, false)
+
+	require.NoError(t, ds.BulkUpsertHostDeviceNameEnforcement(ctx, team.ID))
+	require.NoError(t, ds.SetHostDeviceNameCommandSent(ctx, host.UUID, "DEVNAME-cmd", "WS-1"))
+	err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-cmd", fleet.MDMDeliveryVerifying, "")
+	require.NoError(t, err)
+
+	// A mismatching report arriving shortly after the acknowledgment is a report
+	// that was generated before the device applied the rename, not drift: the row
+	// stays verifying and waits for a fresh report.
+	require.NoError(t, ds.VerifyHostDeviceName(ctx, host.UUID, "stale-pre-rename-name"))
+	require.Equal(t, fleet.MDMDeliveryVerifying, *getDeviceNameRow(t, ds, host.UUID).Status)
+
+	// A matching report is trusted at any time.
+	require.NoError(t, ds.VerifyHostDeviceName(ctx, host.UUID, "WS-1"))
+	require.Equal(t, fleet.MDMDeliveryVerified, *getDeviceNameRow(t, ds, host.UUID).Status)
+
+	// A mismatch on a verified row is genuine drift, grace period or not: the
+	// verified state was reached by a fresh post-rename report, so a later
+	// mismatch means the device was renamed off-template.
+	require.NoError(t, ds.VerifyHostDeviceName(ctx, host.UUID, "renamed-by-user"))
+	require.Equal(t, fleet.MDMDeliveryFailed, *getDeviceNameRow(t, ds, host.UUID).Status)
+
+	// Once the grace period has elapsed, a mismatch on a still-verifying row is
+	// no longer explainable as an in-flight stale report and fails the row.
+	require.NoError(t, ds.ResendHostDeviceName(ctx, host.UUID))
+	require.NoError(t, ds.SetHostDeviceNameCommandSent(ctx, host.UUID, "DEVNAME-cmd-2", "WS-1"))
+	err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-cmd-2", fleet.MDMDeliveryVerifying, "")
+	require.NoError(t, err)
+	_, err = ds.writer(ctx).ExecContext(ctx,
+		`UPDATE host_mdm_apple_device_names SET updated_at = DATE_SUB(NOW(6), INTERVAL 1 HOUR) WHERE host_uuid = ?`, host.UUID)
+	require.NoError(t, err)
+	require.NoError(t, ds.VerifyHostDeviceName(ctx, host.UUID, "still-the-old-name"))
+	row := getDeviceNameRow(t, ds, host.UUID)
+	require.Equal(t, fleet.MDMDeliveryFailed, *row.Status)
+	require.NotEmpty(t, row.Detail)
+}
+
 // testHostDeviceNamesFullLifecycle walks a single host through the entire
 // enforcement state machine in the order the real actors drive it: admin saves a
 // template (bulk upsert), the cron picks up the queued row and sends a command,
@@ -333,13 +423,6 @@ func testHostDeviceNamesFullLifecycle(t *testing.T, ds *Datastore) {
 	_, err = ds.writer(ctx).ExecContext(ctx, `UPDATE hosts SET hardware_serial = ?, computer_name = ? WHERE id = ?`, "SERIAL1", "old-name", host.ID)
 	require.NoError(t, err)
 
-	// renameHost simulates the ack handler renaming the host in Fleet, so name
-	// ingestion (VerifyHostDeviceName) has a real name to report back.
-	renameHost := func(name string) {
-		_, err := ds.writer(ctx).ExecContext(ctx, `UPDATE hosts SET computer_name = ? WHERE id = ?`, name, host.ID)
-		require.NoError(t, err)
-	}
-
 	// 1. Admin saves a template -> the host is queued (status NULL).
 	require.NoError(t, ds.BulkUpsertHostDeviceNameEnforcement(ctx, team.ID))
 	require.Nil(t, getDeviceNameRow(t, ds, host.UUID).Status)
@@ -352,12 +435,8 @@ func testHostDeviceNamesFullLifecycle(t *testing.T, ds *Datastore) {
 	require.NoError(t, ds.SetHostDeviceNameCommandSent(ctx, host.UUID, "DEVNAME-1", "WS-SERIAL1"))
 	require.Equal(t, fleet.MDMDeliveryPending, *getDeviceNameRow(t, ds, host.UUID).Status)
 
-	// 3. MDM acks the command -> rename the host in Fleet, row goes verifying.
-	gotUUID, gotName, err := ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-1", fleet.MDMDeliveryVerifying, "")
-	require.NoError(t, err)
-	require.Equal(t, host.UUID, gotUUID)
-	require.Equal(t, "WS-SERIAL1", gotName)
-	renameHost(gotName)
+	// 3. MDM acks the command -> row goes verifying and the host is renamed in Fleet.
+	require.NoError(t, ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-1", fleet.MDMDeliveryVerifying, ""))
 	require.Equal(t, fleet.MDMDeliveryVerifying, *getDeviceNameRow(t, ds, host.UUID).Status)
 
 	// 4. Name ingestion reports the matching name -> verified.
@@ -384,15 +463,12 @@ func testHostDeviceNamesFullLifecycle(t *testing.T, ds *Datastore) {
 
 	// The superseded command's ack no longer matches the row -> not found, and
 	// the row is untouched (still pending on the newest command).
-	_, _, err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-2a", fleet.MDMDeliveryVerifying, "")
+	err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-2a", fleet.MDMDeliveryVerifying, "")
 	require.True(t, fleet.IsNotFound(err))
 	require.Equal(t, fleet.MDMDeliveryPending, *getDeviceNameRow(t, ds, host.UUID).Status)
 
-	// The newest command's ack is applied.
-	gotUUID, _, err = ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-2b", fleet.MDMDeliveryVerifying, "")
-	require.NoError(t, err)
-	require.Equal(t, host.UUID, gotUUID)
-	renameHost("WS-SERIAL1")
+	// The newest command's ack is applied and renames the host.
+	require.NoError(t, ds.UpdateHostDeviceNameStatusFromCommand(ctx, "DEVNAME-2b", fleet.MDMDeliveryVerifying, ""))
 	require.NoError(t, ds.VerifyHostDeviceName(ctx, host.UUID, "WS-SERIAL1"))
 	require.Equal(t, fleet.MDMDeliveryVerified, *getDeviceNameRow(t, ds, host.UUID).Status)
 }

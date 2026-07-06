@@ -1160,7 +1160,9 @@ type ListHostsPendingDeviceNameCommandFunc func(ctx context.Context, limit int) 
 
 type SetHostDeviceNameCommandSentFunc func(ctx context.Context, hostUUID string, commandUUID string, expectedName string) error
 
-type UpdateHostDeviceNameStatusFromCommandFunc func(ctx context.Context, commandUUID string, status fleet.MDMDeliveryStatus, detail string) (hostUUID string, expectedName string, err error)
+type SetHostDeviceNameResolveResultFunc func(ctx context.Context, hostUUID string, status fleet.MDMDeliveryStatus, expectedName string, detail string) error
+
+type UpdateHostDeviceNameStatusFromCommandFunc func(ctx context.Context, commandUUID string, status fleet.MDMDeliveryStatus, detail string) error
 
 type VerifyHostDeviceNameFunc func(ctx context.Context, hostUUID string, reportedName string) error
 
@@ -3862,6 +3864,9 @@ type DataStore struct {
 
 	SetHostDeviceNameCommandSentFunc        SetHostDeviceNameCommandSentFunc
 	SetHostDeviceNameCommandSentFuncInvoked bool
+
+	SetHostDeviceNameResolveResultFunc        SetHostDeviceNameResolveResultFunc
+	SetHostDeviceNameResolveResultFuncInvoked bool
 
 	UpdateHostDeviceNameStatusFromCommandFunc        UpdateHostDeviceNameStatusFromCommandFunc
 	UpdateHostDeviceNameStatusFromCommandFuncInvoked bool
@@ -9339,7 +9344,14 @@ func (s *DataStore) SetHostDeviceNameCommandSent(ctx context.Context, hostUUID s
 	return s.SetHostDeviceNameCommandSentFunc(ctx, hostUUID, commandUUID, expectedName)
 }
 
-func (s *DataStore) UpdateHostDeviceNameStatusFromCommand(ctx context.Context, commandUUID string, status fleet.MDMDeliveryStatus, detail string) (hostUUID string, expectedName string, err error) {
+func (s *DataStore) SetHostDeviceNameResolveResult(ctx context.Context, hostUUID string, status fleet.MDMDeliveryStatus, expectedName string, detail string) error {
+	s.mu.Lock()
+	s.SetHostDeviceNameResolveResultFuncInvoked = true
+	s.mu.Unlock()
+	return s.SetHostDeviceNameResolveResultFunc(ctx, hostUUID, status, expectedName, detail)
+}
+
+func (s *DataStore) UpdateHostDeviceNameStatusFromCommand(ctx context.Context, commandUUID string, status fleet.MDMDeliveryStatus, detail string) error {
 	s.mu.Lock()
 	s.UpdateHostDeviceNameStatusFromCommandFuncInvoked = true
 	s.mu.Unlock()

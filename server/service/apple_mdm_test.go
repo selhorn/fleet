@@ -5432,6 +5432,11 @@ func TestMDMCommandAndReportResultsIOSIPadOSRefetch(t *testing.T) {
 		require.Equal(t, commandUUID, currentCommandUUID)
 		return nil
 	}
+	ds.VerifyHostDeviceNameFunc = func(ctx context.Context, incomingHostUUID, reportedName string) error {
+		require.Equal(t, hostUUID, incomingHostUUID)
+		require.Equal(t, "Work iPad", reportedName)
+		return nil
+	}
 
 	_, err := svc.CommandAndReportResults(
 		&mdm.Request{Context: ctx},
@@ -5552,6 +5557,9 @@ func TestMDMCommandAndReportResultsIOSRefetchSupplementalOSVersion(t *testing.T)
 		return nil
 	}
 	ds.CleanupStaleNanoRefetchCommandsFunc = func(ctx context.Context, enrollmentID string, commandUUIDPrefix string, currentCommandUUID string) error {
+		return nil
+	}
+	ds.VerifyHostDeviceNameFunc = func(ctx context.Context, incomingHostUUID, reportedName string) error {
 		return nil
 	}
 
@@ -5814,6 +5822,9 @@ func TestMDMCommandAndReportResultsIOSIPadOSRefetchDefensive(t *testing.T) {
 			ds.CleanupStaleNanoRefetchCommandsFunc = func(ctx context.Context, enrollmentID string, commandUUIDPrefix string, currentCommandUUID string) error {
 				return nil
 			}
+			ds.VerifyHostDeviceNameFunc = func(ctx context.Context, incomingHostUUID, reportedName string) error {
+				return nil
+			}
 
 			ds.UpdateHostFunc = func(ctx context.Context, host *fleet.Host) error {
 				assert.Equal(t, tc.expect.expectComputerName, host.ComputerName, "ComputerName")
@@ -5898,6 +5909,9 @@ func TestMDMCommandAndReportResultsIOSRefetchMissingProductNameIPhone(t *testing
 	ds.CleanupStaleNanoRefetchCommandsFunc = func(ctx context.Context, enrollmentID, commandUUIDPrefix, currentCommandUUID string) error {
 		return nil
 	}
+	ds.VerifyHostDeviceNameFunc = func(ctx context.Context, incomingHostUUID, reportedName string) error {
+		return nil
+	}
 
 	var updatedHost *fleet.Host
 	ds.UpdateHostFunc = func(ctx context.Context, host *fleet.Host) error {
@@ -5965,6 +5979,122 @@ func TestMDMCommandAndReportResultsIOSRefetchMissingProductNameIPhone(t *testing
 	assert.Equal(t, "ios", updatedOS.Platform)
 }
 
+func TestHandleDeviceNameCommandResult(t *testing.T) {
+	cmdUUID := fleet.DeviceNameCommandUUIDPrefix + "cmd-1"
+
+	// settingsAck builds a Settings command acknowledgment whose single item
+	// carries the given per-item status and (optional) error chain.
+	settingsAck := func(itemStatus string, chain []mdm.ErrorChain) []byte {
+		var errChainXML string
+		for _, e := range chain {
+			errChainXML += fmt.Sprintf(`<dict>
+				<key>ErrorCode</key><integer>%d</integer>
+				<key>ErrorDomain</key><string>%s</string>
+				<key>USEnglishDescription</key><string>%s</string>
+			</dict>`, e.ErrorCode, e.ErrorDomain, e.USEnglishDescription)
+		}
+		itemErrChain := ""
+		if errChainXML != "" {
+			itemErrChain = "<key>ErrorChain</key><array>" + errChainXML + "</array>"
+		}
+		return []byte(fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+	<key>CommandUUID</key><string>%s</string>
+	<key>Status</key><string>Acknowledged</string>
+	<key>Settings</key>
+	<array><dict><key>Item</key><string>DeviceName</string><key>Status</key><string>%s</string>%s</dict></array>
+</dict></plist>`, cmdUUID, itemStatus, itemErrChain))
+	}
+
+	cases := []struct {
+		name         string
+		status       string
+		raw          []byte
+		errorChain   []mdm.ErrorChain
+		notFound     bool // UpdateHostDeviceNameStatusFromCommand returns not-found (stale)
+		wantStatus   fleet.MDMDeliveryStatus
+		wantDetail   string
+		wantNoUpdate bool
+	}{
+		{
+			name:       "acknowledged clean renames and verifies",
+			status:     fleet.MDMAppleStatusAcknowledged,
+			raw:        settingsAck(fleet.MDMAppleStatusAcknowledged, nil),
+			wantStatus: fleet.MDMDeliveryVerifying,
+		},
+		{
+			name:   "acknowledged with per-item Settings error fails",
+			status: fleet.MDMAppleStatusAcknowledged,
+			raw: settingsAck("Error", []mdm.ErrorChain{
+				{ErrorCode: 12026, ErrorDomain: "MCMDMErrorDomain", USEnglishDescription: "The device is not supervised."},
+			}),
+			wantStatus: fleet.MDMDeliveryFailed,
+			wantDetail: "The device is not supervised.",
+		},
+		{
+			name:       "command error fails with the apple error chain",
+			status:     fleet.MDMAppleStatusError,
+			errorChain: []mdm.ErrorChain{{ErrorCode: 99, ErrorDomain: "MCMDMErrorDomain", USEnglishDescription: "boom"}},
+			wantStatus: fleet.MDMDeliveryFailed,
+			wantDetail: "boom",
+		},
+		{
+			name:         "stale result for a superseded command is ignored",
+			status:       fleet.MDMAppleStatusAcknowledged,
+			raw:          settingsAck(fleet.MDMAppleStatusAcknowledged, nil),
+			notFound:     true,
+			wantNoUpdate: true,
+		},
+		{
+			name:         "not-now is a no-op",
+			status:       fleet.MDMAppleStatusNotNow,
+			wantNoUpdate: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ds := new(mock.Store)
+			svc := MDMAppleCheckinAndCommandService{ds: ds, logger: slog.New(slog.DiscardHandler)}
+
+			var gotStatus fleet.MDMDeliveryStatus
+			var gotDetail string
+			ds.UpdateHostDeviceNameStatusFromCommandFunc = func(ctx context.Context, commandUUID string, status fleet.MDMDeliveryStatus, detail string) error {
+				require.Equal(t, cmdUUID, commandUUID)
+				gotStatus, gotDetail = status, detail
+				if tc.notFound {
+					return &notFoundError{}
+				}
+				return nil
+			}
+
+			err := svc.handleDeviceNameCommandResult(t.Context(), &mdm.CommandResults{
+				CommandUUID: cmdUUID,
+				Status:      tc.status,
+				ErrorChain:  tc.errorChain,
+				Raw:         tc.raw,
+			})
+			require.NoError(t, err)
+
+			if tc.wantNoUpdate {
+				if tc.notFound {
+					// the update was attempted but returned not-found; no rename
+					require.True(t, ds.UpdateHostDeviceNameStatusFromCommandFuncInvoked)
+				} else {
+					require.False(t, ds.UpdateHostDeviceNameStatusFromCommandFuncInvoked)
+				}
+				return
+			}
+
+			require.True(t, ds.UpdateHostDeviceNameStatusFromCommandFuncInvoked)
+			require.Equal(t, tc.wantStatus, gotStatus)
+			if tc.wantDetail != "" {
+				require.Contains(t, gotDetail, tc.wantDetail)
+			}
+		})
+	}
+}
+
 func TestMDMCommandAndReportResultsIOSRefetchSupplementalOSVersionNonString(t *testing.T) {
 	ctx := context.Background()
 	hostID := uint(99)
@@ -5996,6 +6126,9 @@ func TestMDMCommandAndReportResultsIOSRefetchSupplementalOSVersionNonString(t *t
 		return nil
 	}
 	ds.CleanupStaleNanoRefetchCommandsFunc = func(ctx context.Context, enrollmentID string, commandUUIDPrefix string, currentCommandUUID string) error {
+		return nil
+	}
+	ds.VerifyHostDeviceNameFunc = func(ctx context.Context, incomingHostUUID, reportedName string) error {
 		return nil
 	}
 
@@ -6073,6 +6206,9 @@ func TestMDMCommandAndReportResultsIOSRefetchSupplementalOSVersionFallbackTrunca
 		return nil
 	}
 	ds.CleanupStaleNanoRefetchCommandsFunc = func(ctx context.Context, enrollmentID string, commandUUIDPrefix string, currentCommandUUID string) error {
+		return nil
+	}
+	ds.VerifyHostDeviceNameFunc = func(ctx context.Context, incomingHostUUID, reportedName string) error {
 		return nil
 	}
 

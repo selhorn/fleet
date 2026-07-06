@@ -1808,10 +1808,21 @@ type Datastore interface {
 	// recording the enqueued command UUID and the resolved name that was sent.
 	SetHostDeviceNameCommandSent(ctx context.Context, hostUUID, commandUUID, expectedName string) error
 
+	// SetHostDeviceNameResolveResult records the outcome of resolving a host's
+	// name template when no command is sent: verified when the host already
+	// matches the resolved name, or failed when the resolved name can't be
+	// applied (e.g. it exceeds Apple's 63-byte limit). The resolved name is
+	// stored as the expected name so later reports can be reconciled against
+	// it, and any previous command UUID is cleared so a stale command result
+	// can't overwrite this outcome.
+	SetHostDeviceNameResolveResult(ctx context.Context, hostUUID string, status MDMDeliveryStatus, expectedName, detail string) error
+
 	// UpdateHostDeviceNameStatusFromCommand updates the enforcement row matching
-	// the given command UUID to the given status and detail, returning the host
-	// UUID and expected name so the caller can rename the host in Fleet on
-	// acknowledgment.
+	// the given command UUID to the given status and detail. When status is
+	// MDMDeliveryVerifying (the device acknowledged the rename), it also renames
+	// the host in Fleet in the same transaction — setting the host's computer
+	// name and hostname to the row's expected name and updating its display name
+	// — so the row transition and the Fleet-side rename are atomic.
 	//
 	// A host holds only its most recently sent command UUID (one row per host),
 	// so a result for a superseded command (e.g. the template was re-saved or the
@@ -1820,7 +1831,7 @@ type Datastore interface {
 	// command, ignore" (check fleet.IsNotFound) rather than a failure: the device
 	// processes commands FIFO and ends on the latest name, which the matching
 	// (newest) command's result records.
-	UpdateHostDeviceNameStatusFromCommand(ctx context.Context, commandUUID string, status MDMDeliveryStatus, detail string) (hostUUID string, expectedName string, err error)
+	UpdateHostDeviceNameStatusFromCommand(ctx context.Context, commandUUID string, status MDMDeliveryStatus, detail string) error
 
 	// VerifyHostDeviceName reconciles the enforcement row for a host against the
 	// name reported by the device. reportedName is the host's current name as
@@ -1829,6 +1840,12 @@ type Datastore interface {
 	// rows in the verifying or verified state: a match moves the row to verified;
 	// a mismatch moves it to failed (drift). Rows in any other state, or hosts
 	// with no row, are left untouched.
+	//
+	// A mismatch on a row that entered verifying only recently is ignored (the
+	// row stays verifying): a report generated before the device applied the
+	// rename can arrive after the acknowledgment and still carry the old name,
+	// and treating it as drift would strand the host at failed until an
+	// explicit resend.
 	VerifyHostDeviceName(ctx context.Context, hostUUID, reportedName string) error
 
 	// GetHostDeviceNameEnforcement returns the host-name enforcement row for the
